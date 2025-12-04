@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monitoramento de Consumo de Energia - ADS</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configuração do Tailwind com Font Inter -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f7f7;
+        }
+        /* Estilos personalizados para a navegação móvel */
+        .nav-item {
+            flex: 1 1 0%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 8px;
+            border-radius: 8px;
+            transition: background-color 0.2s;
+        }
+        .nav-item.active {
+            color: white;
+            background-color: #059669; /* emerald-600 */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body>
+
+    <div id="app" class="min-h-screen flex flex-col">
+        <!-- O conteúdo será renderizado aqui pelo JavaScript -->
+        <div class="flex-grow flex items-center justify-center p-4">
+            <div class="text-center p-8 bg-white rounded-xl shadow-lg">
+                <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-emerald-500 mx-auto"></div>
+                <p class="mt-4 text-gray-600">Carregando aplicação...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase SDKs - Importados como módulos -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, onSnapshot, addDoc, setDoc, doc, getDoc, query, orderBy, serverTimestamp, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- 1. VARIÁVEIS GLOBAIS DE AMBIENTE ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        // Tenta parsear a configuração, se não existir, retorna null
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // Taxas de Referência
+        const TARIFA_MEDIA_PADRAO = 0.95; 
+        const CO2_EMISSAO_KG_KWH = 0.08;
+        
+        // --- 2. ESTADO GLOBAL DA APLICAÇÃO ---
+        const state = {
+            db: null,
+            auth: null,
+            userId: null,
+            authReady: false,
+            settingsReady: false, // Novo estado para saber se as configurações foram carregadas
+            page: 'dashboard',
+            error: '',
+            readings: [],
+            // Valores iniciais antes de carregar do Firestore
+            currentGoal: { kWh: 250, R$: 250 * TARIFA_MEDIA_PADRAO }, 
+            currentTariff: TARIFA_MEDIA_PADRAO, 
+            newReadingValue: '',
+            isSaving: false,
+        };
+
+        // --- 3. FUNÇÕES UTILITÁRIAS ---
+        const formatCurrency = (value) => `R$ ${parseFloat(value).toFixed(2).replace('.', ',')}`;
+        const formatKWh = (value) => `${parseFloat(value).toFixed(2).replace('.', ',')} kWh`;
+        
+        // Converte o Timestamp do Firestore ou o objeto Date para string de data
+        const toDateObject = (timestamp) => {
+             if (!timestamp) return null;
+             return timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+        };
+        
+        const formatDate = (timestamp) => {
+            const date = toDateObject(timestamp);
+            if (!date) return 'N/A';
+            return date.toLocaleDateString('pt-BR');
+        };
+        
+        // Retorna o caminho para o documento de configurações do usuário
+        const getUserSettingsDocPath = () => {
+            if (!state.userId) return null;
+            return doc(state.db, `/artifacts/${appId}/users/${state.userId}/settings`, 'config');
+        };
+
+        // Função principal de renderização (reage às mudanças de estado)
+        const renderApp = () => {
+            const appDiv = document.getElementById('app');
+            const { page, authReady, error, userId, settingsReady } = state;
+
+            // HTML principal da aplicação (Incluindo navegação)
+            appDiv.innerHTML = `
+                <main class="flex-grow pb-24 md:pb-4 bg-gray-100 p-4">
+                    <div class="max-w-4xl mx-auto space-y-6">
+                        ${renderContent()}
+                        ${error ? `<div class="bg-red-100 p-3 rounded-lg text-red-700 text-sm mt-4">${error}</div>` : ''}
+                    </div>
+                </main>
+                <nav class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-2xl p-2 md:relative md:border-none md:shadow-none md:p-0">
+                    <div class="max-w-4xl mx-auto flex justify-around">
+                        ${NavigationItem('dashboard', 'Dashboard', '🏠')}
+                        ${NavigationItem('register', 'Registrar Leitura', '✍️')}
+                        ${NavigationItem('goals', 'Metas/Config', '⚙️')}
+                        ${NavigationItem('history', 'Histórico', '📖')}
+                    </div>
+                </nav>
+            `;
+            
+            // Adiciona event listeners após a renderização
+            setupEventListeners();
+        };
+
+        // Componente de navegação (HTML string)
+        const NavigationItem = (target, label, icon) => `
+            <button
+                data-page="${target}"
+                class="nav-item ${state.page === target ? 'active' : 'text-gray-500 hover:bg-gray-100'} transition-colors"
+                aria-label="${label}"
+            >
+                <span class="text-xl">${icon}</span>
+                <span class="text-xs mt-1 font-medium hidden sm:block">${label}</span>
+            </button>
+        `;
+        
+        // Configura os event listeners para a navegação e formulários
+        const setupEventListeners = () => {
+            // Event listeners para navegação
+            document.querySelectorAll('.nav-item').forEach(button => {
+                button.onclick = () => {
+                    state.page = button.dataset.page;
+                    renderApp(); // Rerenderiza o aplicativo
+                };
+            });
+
+            // Event listener para o formulário de registro
+            if (state.page === 'register') {
+                const form = document.getElementById('register-form');
+                if (form) {
+                    form.onsubmit = handleRegisterReading;
+                }
+                const input = document.getElementById('readingValue');
+                if (input) {
+                    input.oninput = (e) => {
+                        state.newReadingValue = e.target.value;
+                        // Não renderiza aqui, apenas atualiza o estado
+                    };
+                }
+            }
+
+            // Event listeners para o formulário de metas/configurações
+            if (state.page === 'goals' && state.settingsReady) {
+                const tariffInput = document.getElementById('tariffValue');
+                if (tariffInput) {
+                    tariffInput.oninput = (e) => {
+                        const newTariff = parseFloat(e.target.value) || 0;
+                        state.currentTariff = newTariff;
+                        state.currentGoal.R$ = state.currentGoal.kWh * newTariff; // Recalcula o custo da meta
+                        saveUserSettings(); // Salva no Firestore
+                        renderApp(); 
+                    };
+                }
+                const goalKwhInput = document.getElementById('goalKwh');
+                if (goalKwhInput) {
+                    goalKwhInput.oninput = (e) => {
+                        const newKwh = parseFloat(e.target.value) || 0;
+                        state.currentGoal.kWh = newKwh;
+                        state.currentGoal.R$ = newKwh * state.currentTariff; // Recalcula o custo da meta
+                        saveUserSettings(); // Salva no Firestore
+                        renderApp();
+                    };
+                }
+            }
+        };
+
+        // --- 4. FUNÇÕES DE CÁLCULO E ANÁLISE ---
+
+        const calculateLastCycleData = () => {
+            const { readings, currentTariff } = state;
+            if (readings.length < 2) return null;
+
+            const last = readings[readings.length - 1];
+            const prev = readings[readings.length - 2];
+            
+            // CONVERSÃO DE TIMESTAMP PARA OBJETO DATE AQUI
+            const dataFim = toDateObject(last.dataLeitura);
+            const dataInicio = toDateObject(prev.dataLeitura);
+
+            if (!dataFim || !dataInicio) return null; // Garante que as datas são válidas
+
+            const consumoTotal = last.valorLeituraKWh - prev.valorLeituraKWh;
+            const custoTotal = consumoTotal * currentTariff;
+            
+            const diffTime = Math.abs(dataFim.getTime() - dataInicio.getTime());
+            // Calcula a diferença em dias. Usa 1 para garantir cálculo se for menos de 24h
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); 
+
+            const consumoMedioDiario = diffDays > 0 ? consumoTotal / diffDays : 0;
+
+            return { consumoTotal, custoTotal, diffDays, consumoMedioDiario, dataInicio, dataFim };
+        };
+
+        const calculateDashboardAnalysis = (lastCycleData) => {
+            if (!lastCycleData) return null;
+
+            const { consumoTotal, diffDays, consumoMedioDiario } = lastCycleData;
+            const { currentGoal, currentTariff } = state;
+            
+            const totalDaysInCycle = 30; // Ciclo padrão de 30 dias
+            const daysRemaining = Math.max(0, totalDaysInCycle - diffDays);
+            
+            let projectionKWh = consumoTotal;
+            let projectionR = lastCycleData.custoTotal;
+            let anomalyMessage = null;
+
+            if (diffDays > 0) { // Só projeta se tiver dados suficientes (pelo menos 1 dia)
+                 // Projeta o consumo total para 30 dias
+                projectionKWh = consumoTotal + (consumoMedioDiario * daysRemaining);
+                projectionR = projectionKWh * currentTariff;
+            }
+
+            // Anomalia: 20% acima da meta diária
+            const goalDaily = currentGoal.kWh / totalDaysInCycle;
+            if (consumoMedioDiario > goalDaily * 1.2) {
+                anomalyMessage = `Seu consumo diário (${consumoMedioDiario.toFixed(2)} kWh) está 20% acima da meta diária (${goalDaily.toFixed(2)} kWh). Você pode exceder sua meta em breve.`;
+            }
+
+            // CO2 evitado é a diferença entre a meta e a projeção, multiplicado pela emissão por kWh
+            const co2AvoidedKg = (currentGoal.kWh - projectionKWh > 0 ? currentGoal.kWh - projectionKWh : 0) * CO2_EMISSAO_KG_KWH;
+
+            return {
+                projectionKWh,
+                projectionR,
+                consumoMedioDiario,
+                daysMeasured: diffDays,
+                daysRemaining,
+                anomalyMessage,
+                co2AvoidedKg
+            };
+        };
+
+
+        // --- 5. COMPONENTES/RENDERIZAÇÃO DE TELA ---
+
+        const renderContent = () => {
+            // Espera a autenticação E o carregamento das configurações
+            if (!state.authReady || !state.settingsReady) {
+                return `
+                    <div class="text-center p-12 bg-white rounded-xl shadow-lg mt-8">
+                        <div class="animate-spin rounded-full h-10 w-10 border-b-2 border-green-500 mx-auto"></div>
+                        <p class="mt-4 text-gray-600">Aguardando autenticação e sincronização de dados...</p>
+                    </div>
+                `;
+            }
+            
+            switch (state.page) {
+                case 'dashboard':
+                    return renderDashboardScreen();
+                case 'register':
+                    return renderRegisterScreen();
+                case 'goals':
+                    return renderGoalsScreen();
+                case 'history':
+                    return renderHistoryScreen();
+                default:
+                    return renderDashboardScreen();
+            }
+        };
+
+        const renderDataCard = (title, value, description, color) => `
+            <div class="p-5 rounded-xl text-white shadow-lg ${color} transition-transform transform hover:scale-[1.02]">
+                <p class="text-sm font-light opacity-80 whitespace-nowrap overflow-hidden text-ellipsis">${title}</p>
+                <p class="text-3xl font-extrabold mt-1">${value}</p>
+                <p class="text-xs mt-2 opacity-90 border-t border-white/30 pt-1">${description}</p>
+            </div>
+        `;
+
+        const renderDashboardScreen = () => {
+            const lastCycleData = calculateLastCycleData();
+            const analysis = calculateDashboardAnalysis(lastCycleData);
+
+            if (state.readings.length < 2) {
+                return `
+                    <h2 class="text-3xl font-bold text-gray-800 border-b-2 border-emerald-500 pb-2 mb-6">Seu Resumo de Energia ⚡</h2>
+                    <div class="bg-yellow-100 p-6 rounded-xl text-yellow-800 shadow-md">
+                        <p class="font-semibold text-lg">Comece a Monitorar!</p>
+                        <p class="mt-2">Você precisa de pelo menos duas leituras para calcular o consumo e as projeções.</p>
+                        <p class="mt-4 text-xs text-gray-600">Tarifa Atual: ${formatCurrency(state.currentTariff)} | Meta: ${formatKWh(state.currentGoal.kWh)}</p>
+                    </div>
+                    <div class="p-4 bg-gray-50 rounded-lg mt-6">
+                        <p class="text-xs text-gray-500">
+                            UID do Usuário: <span class="font-mono break-all text-xs text-gray-700">${state.userId || 'Não autenticado'}</span>
+                        </p>
+                    </div>
+                `;
+            }
+
+            return `
+                <h2 class="text-3xl font-bold text-gray-800 border-b-2 border-emerald-500 pb-2 mb-6">Seu Resumo de Energia ⚡</h2>
+                
+                ${analysis.anomalyMessage ? `
+                    <div class="bg-red-100 p-4 rounded-xl text-red-800 border-l-4 border-red-500 shadow-md">
+                        <p class="font-bold">Alerta de Consumo Alto!</p>
+                        <p class="text-sm mt-1">${analysis.anomalyMessage}</p>
+                    </div>
+                ` : ''}
+
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    ${renderDataCard(
+                        "Projeção de Custo (Ciclo)", 
+                        formatCurrency(analysis.projectionR), 
+                        `Meta: ${formatCurrency(state.currentGoal.R$)} | Faltam ${analysis.daysRemaining} dias`,
+                        analysis.projectionR > state.currentGoal.R$ * 1.05 ? 'bg-red-500' : 'bg-emerald-600'
+                    )}
+                    ${renderDataCard(
+                        "Consumo Diário Médio", 
+                        formatKWh(analysis.consumoMedioDiario), 
+                        `Dias Medidos: ${analysis.daysMeasured}`,
+                        'bg-blue-500'
+                    )}
+                    ${renderDataCard(
+                        "CO2 Potencialmente Evitado (ODS 7)", 
+                        `${analysis.co2AvoidedKg.toFixed(2)} kg CO₂`, 
+                        "Simulação de Impacto (Se mantiver a meta)",
+                        'bg-teal-500'
+                    )}
+                    ${renderDataCard(
+                        "Tarifa Atual", 
+                        formatCurrency(state.currentTariff), 
+                        "Preço base por kWh",
+                        'bg-yellow-500'
+                    )}
+                </div>
+
+                ${renderChart()}
+                <div class="p-4 bg-gray-50 rounded-lg">
+                    <p class="text-xs text-gray-500">
+                        UID do Usuário: <span class="font-mono break-all text-xs text-gray-700">${state.userId || 'Não autenticado'}</span>
+                    </p>
+                </div>
+            `;
+        };
+        
+        const renderChart = () => {
+             // Simulação de gráfico simples com barras HTML (sem biblioteca externa)
+            // Apenas considera o consumo incremental entre leituras, não o total acumulado.
+            const readingsForChart = state.readings.slice(-7);
+            if (readingsForChart.length < 2) return '';
+
+            // Calcula o consumo entre cada par de leituras consecutivas
+            const consumptions = [];
+            for (let i = 1; i < readingsForChart.length; i++) {
+                consumptions.push(readingsForChart[i].valorLeituraKWh - readingsForChart[i-1].valorLeituraKWh);
+            }
+            
+            const maxConsumption = Math.max(...consumptions);
+            if (maxConsumption <= 0) return ''; // Evita divisão por zero
+
+            const bars = readingsForChart.slice(1).map((reading, index) => {
+                const consumption = consumptions[index];
+                const height = (consumption / maxConsumption) * 100;
+                
+                return `
+                    <div class="flex flex-col items-center h-full justify-end w-1/7 px-1 group">
+                        <div 
+                            style="height: ${height * 0.8}%;" 
+                            class="w-full bg-emerald-400 rounded-t-lg transition-all duration-300 hover:bg-emerald-600 relative"
+                        >
+                            <span class="absolute -top-6 text-xs w-full text-center text-gray-600 hidden group-hover:block transition-opacity duration-300">
+                                ${consumption.toFixed(2)} kWh
+                            </span>
+                        </div>
+                        <span class="text-xs mt-1 text-gray-500">
+                            ${formatDate(reading.dataLeitura).slice(0, 5)}
+                        </span>
+                    </div>
+                `;
+            }).join('');
+
+            return `
+                <div class="bg-white p-6 rounded-xl shadow-lg mt-4">
+                    <h3 class="text-xl font-semibold mb-4 text-gray-700">Consumo Histórico Recente (kWh)</h3>
+                    <div class="flex justify-between items-end h-48 border-l border-b border-gray-300 p-2">
+                        ${bars}
+                    </div>
+                    <p class='text-sm text-gray-400 mt-2 text-right'>Consumo incremental entre as últimas leituras (máx. 7)</p>
+                </div>
+            `;
+        };
+
+
+        const renderRegisterScreen = () => {
+            const lastReading = state.readings.length > 0 ? state.readings[state.readings.length - 1] : null;
+            const minReading = lastReading ? (lastReading.valorLeituraKWh + 0.01).toFixed(2) : 0;
+            const isInputDisabled = state.isSaving || !state.authReady || !state.settingsReady;
+
+            return `
+                <div class="space-y-6 p-4 max-w-lg mx-auto bg-white rounded-xl shadow-lg mt-8">
+                    <h2 class="text-3xl font-bold text-gray-800 border-b-2 border-emerald-500 pb-2">Registrar Nova Leitura 🧾</h2>
+                    
+                    <p class='text-gray-600'>
+                        ${lastReading 
+                            ? `Última leitura registrada em ${formatDate(lastReading.dataLeitura)}: <span class="font-bold">${formatKWh(lastReading.valorLeituraKWh)}</span>`
+                            : 'Esta será sua primeira leitura de medidor. Insira o valor atual.'
+                        }
+                    </p>
+
+                    <form id="register-form" class="space-y-4">
+                        <label for="readingValue" class="block text-sm font-medium text-gray-700">
+                            Valor Atual do Medidor (kWh)
+                        </label>
+                        <input
+                            id="readingValue"
+                            type="number"
+                            step="0.01"
+                            min="${minReading}"
+                            value="${state.newReadingValue}"
+                            placeholder="Ex: 15480.25"
+                            class="mt-1 block w-full px-4 py-3 border-2 border-gray-300 rounded-lg shadow-sm focus:border-emerald-500 focus:ring focus:ring-emerald-200 focus:ring-opacity-50 text-xl font-mono"
+                            ${isInputDisabled ? 'disabled' : ''}
+                            required
+                        />
+                        
+                        <p class='text-xs text-gray-500'>*Insira o valor acumulado exato do seu medidor de energia.</p>
+
+                        <button
+                            type="submit"
+                            class="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-md text-lg font-medium text-white bg-emerald-600 hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 transition-colors ${isInputDisabled ? 'opacity-50 cursor-not-allowed' : ''}"
+                            ${state.isSaving ? 'disabled' : ''}
+                        >
+                            ${state.isSaving ? 'Salvando...' : 'Registrar Leitura Agora'}
+                        </button>
+                    </form>
+                </div>
+            `;
+        };
+        
+        const renderGoalsScreen = () => `
+            <div class="space-y-6 p-4 max-w-lg mx-auto bg-white rounded-xl shadow-lg mt-8">
+                <h2 class="text-3xl font-bold text-gray-800 border-b-2 border-emerald-500 pb-2">Metas e Configurações ⚙️</h2>
+
+                <!-- Configuração de Tarifa -->
+                <div class="bg-green-50 p-6 rounded-xl border border-green-200">
+                    <h3 class="text-xl font-semibold text-green-800 mb-3">Tarifa Atual (R$/kWh)</h3>
+                    <p class="text-3xl font-bold text-green-600">${formatCurrency(state.currentTariff)}</p>
+                    <div class='mt-4'>
+                        <label for="tariffValue" class="block text-sm font-medium text-gray-700">Novo Valor de Tarifa</label>
+                        <input
+                            id="tariffValue"
+                            type="number"
+                            step="0.001"
+                            min="0"
+                            value="${state.currentTariff}"
+                            class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg"
+                        />
+                        <p class="text-xs text-gray-500 mt-1">O cálculo do custo usa este valor (Padrão: ${formatCurrency(TARIFA_MEDIA_PADRAO)}). A tarifa é salva automaticamente.</p>
+                    </div>
+                </div>
+                
+                <!-- Configuração de Meta -->
+                <div class="bg-blue-50 p-6 rounded-xl border border-blue-200">
+                    <h3 class="text-xl font-semibold text-blue-800 mb-3">Meta de Consumo Mensal</h3>
+                    <div class="space-y-4">
+                        <div>
+                            <label for="goalKwh" class="block text-sm font-medium text-gray-700 mb-1">Meta em kWh</label>
+                            <input
+                                id="goalKwh"
+                                type="number"
+                                step="1"
+                                min="1"
+                                value="${state.currentGoal.kWh}"
+                                class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg"
+                            />
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Meta em Reais (R$)</label>
+                            <input
+                                type="text"
+                                value="${formatCurrency(state.currentGoal.R$)}"
+                                readonly
+                                class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-100 text-gray-500"
+                            />
+                            <p class="text-xs text-gray-500 mt-1">Calculado automaticamente com base na tarifa atual. A meta é salva automaticamente.</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="mt-6 p-4 bg-gray-50 rounded-lg">
+                    <p class="text-xs text-gray-500">
+                        UID do Usuário: <span class="font-mono break-all text-xs text-gray-700">${state.userId || 'Aguardando autenticação...'}</span>
+                    </p>
+                </div>
+            </div>
+        `;
+        
+        const renderHistoryScreen = () => {
+            if (state.readings.length === 0) {
+                return `
+                    <h2 class="text-3xl font-bold text-gray-800 border-b-2 border-emerald-500 pb-2 mb-6">Histórico Detalhado 📜</h2>
+                    <p class="text-gray-500">Nenhum registro encontrado.</p>
+                `;
+            }
+            
+            // Revertendo a ordem para mostrar do mais novo (topo) para o mais antigo
+            const reversedReadings = [...state.readings].reverse();
+
+            const tableRows = reversedReadings.map((r, index) => `
+                <tr class="${r.isInitial ? 'bg-yellow-50/50' : (index % 2 === 0 ? 'bg-white' : 'bg-gray-50')} hover:bg-emerald-50 transition-colors">
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${formatDate(r.dataLeitura)}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 font-mono">${formatKWh(r.valorLeituraKWh)}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-700 font-semibold">
+                        ${r.isInitial ? 'Leitura Inicial' : formatKWh(r.consumoCalculadoKWh)}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-emerald-700 font-bold">
+                        ${r.isInitial ? '-' : formatCurrency(r.custoCalculadoR)}
+                    </td>
+                </tr>
+            `).join('');
+
+            return `
+                <h2 class="text-3xl font-bold text-gray-800 border-b-2 border-emerald-500 pb-2 mb-6">Histórico Detalhado 📜</h2>
+                <div class="overflow-x-auto bg-white rounded-xl shadow-lg">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Data</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Acumulado</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Consumo Período</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Custo Estimado</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            ${tableRows}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        };
+
+        // --- 6. FUNÇÃO PRINCIPAL DE REGISTRO DE LEITURA (Firestore Write) ---
+        const handleRegisterReading = async (e) => {
+            e.preventDefault();
+            
+            if (!state.db || !state.userId || state.isSaving) {
+                if (!state.db && state.authReady) {
+                    state.error = "Não é possível salvar dados. O Firestore não está conectado (verifique a mensagem de erro acima).";
+                }
+                 renderApp();
+                 return;
+            }
+
+            const newReadingValueNum = parseFloat(state.newReadingValue);
+            if (isNaN(newReadingValueNum) || newReadingValueNum <= 0) {
+                state.error = "O valor da leitura deve ser um número positivo válido.";
+                renderApp();
+                return;
+            }
+
+            const lastReading = state.readings.length > 0 ? state.readings[state.readings.length - 1] : null;
+
+            if (lastReading && newReadingValueNum <= lastReading.valorLeituraKWh) {
+                state.error = "A nova leitura deve ser maior que a última registrada.";
+                renderApp();
+                return;
+            }
+
+            state.isSaving = true;
+            state.error = '';
+            renderApp();
+
+            try {
+                await runTransaction(state.db, async (transaction) => {
+                    const readingsPath = `/artifacts/${appId}/users/${state.userId}/readings`;
+                    const readingsRef = collection(state.db, readingsPath);
+                    
+                    let consumoCalculadoKWh = 0;
+                    let custoCalculadoR = 0;
+
+                    if (lastReading) {
+                        consumoCalculadoKWh = newReadingValueNum - lastReading.valorLeituraKWh;
+                        custoCalculadoR = consumoCalculadoKWh * state.currentTariff;
+                    }
+
+                    const newReading = {
+                        userId: state.userId,
+                        valorLeituraKWh: newReadingValueNum,
+                        consumoCalculadoKWh: consumoCalculadoKWh,
+                        custoCalculadoR: custoCalculadoR,
+                        dataLeitura: serverTimestamp(), 
+                        tarifaUsada: state.currentTariff,
+                        isInitial: !lastReading 
+                    };
+
+                    await addDoc(readingsRef, newReading);
+                });
+
+                state.newReadingValue = '';
+                state.page = 'dashboard';
+            } catch (e) {
+                console.error("Erro ao registrar a leitura:", e);
+                state.error = "Falha ao salvar a leitura. Tente novamente.";
+            } finally {
+                state.isSaving = false;
+                renderApp();
+            }
+        };
+        
+        // --- 7. FUNÇÕES DE PERSISTÊNCIA DE CONFIGURAÇÕES ---
+        
+        // Carrega a tarifa e a meta salvas no Firestore
+        const loadUserSettings = async () => {
+            if (!state.db || !state.userId) return;
+
+            try {
+                const settingsDocRef = getUserSettingsDocPath();
+                const docSnap = await getDoc(settingsDocRef);
+
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    state.currentTariff = data.currentTariff !== undefined ? data.currentTariff : TARIFA_MEDIA_PADRAO;
+                    state.currentGoal.kWh = data.goalKwh !== undefined ? data.goalKwh : 250;
+                    state.currentGoal.R$ = state.currentGoal.kWh * state.currentTariff;
+                } else {
+                    // Se não houver configurações, salva as configurações padrão para iniciar
+                    await saveUserSettings();
+                }
+            } catch (e) {
+                console.error("Erro ao carregar configurações do usuário:", e);
+                state.error = "Não foi possível carregar as configurações. Usando valores padrão.";
+            } finally {
+                state.settingsReady = true; // Marca como pronto, mesmo que tenha dado erro ou usado o padrão
+                setupDataListener(); // Inicia o listener de leituras após carregar as configurações
+                renderApp();
+            }
+        };
+
+        // Salva a tarifa e a meta atuais no Firestore
+        const saveUserSettings = async () => {
+            if (!state.db || !state.userId) return;
+            
+            try {
+                const settingsDocRef = getUserSettingsDocPath();
+                const settingsData = {
+                    currentTariff: state.currentTariff,
+                    goalKwh: state.currentGoal.kWh,
+                    // dataAtualizacao: serverTimestamp() // Opcional, mas útil
+                };
+                
+                // Usa setDoc com merge: true para não sobrescrever outros campos se existirem
+                await setDoc(settingsDocRef, settingsData, { merge: true });
+            } catch (e) {
+                console.error("Erro ao salvar configurações do usuário:", e);
+                state.error = "Não foi possível salvar as configurações de meta/tarifa.";
+                renderApp();
+            }
+        };
+
+
+        // --- 8. INICIALIZAÇÃO DO FIREBASE E LISTENERS ---
+
+        const initializeFirebase = () => {
+            if (!firebaseConfig) {
+                state.error = "Configuração do Firebase não encontrada. O modo de persistência de dados (Firestore) está desativado.";
+                state.authReady = true;
+                state.settingsReady = true; // Avança para carregar o Dashboard
+                renderApp(); 
+                return;
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                state.db = getFirestore(app);
+                state.auth = getAuth(app);
+
+                // Listener para o estado de autenticação
+                onAuthStateChanged(state.auth, async (user) => {
+                    if (user) {
+                        state.userId = user.uid;
+                    } else {
+                        // Tenta autenticar com o token personalizado ou anonimamente
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(state.auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(state.auth);
+                        }
+                    }
+                    state.authReady = true;
+                    // Move o carregamento de dados e o listener de leituras para DENTRO de loadUserSettings
+                    await loadUserSettings(); 
+                    // O renderApp final será chamado dentro de loadUserSettings
+                });
+            } catch (e) {
+                console.error("Erro ao inicializar Firebase:", e);
+                state.error = "Erro ao conectar ao serviço de dados. Verifique a configuração.";
+                state.authReady = true;
+                state.settingsReady = true;
+                renderApp();
+            }
+        };
+        
+        // Configura o listener do Firestore para as leituras (Chamado APÓS as configurações serem carregadas)
+        const setupDataListener = () => {
+            if (!state.authReady || !state.settingsReady || !state.userId || !state.db) return;
+
+            const readingsPath = `/artifacts/${appId}/users/${state.userId}/readings`;
+            // Ordena pela data de leitura ascendente para facilitar o cálculo do ciclo
+            const q = query(collection(state.db, readingsPath), orderBy('dataLeitura', 'asc'));
+
+            onSnapshot(q, (snapshot) => {
+                const fetchedReadings = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                // Mantém a ordem do Firestore (ascendente) para facilitar os cálculos
+                state.readings = fetchedReadings; 
+                renderApp();
+            }, (err) => {
+                console.error("Erro ao carregar leituras:", err);
+                state.error = "Falha ao sincronizar dados de consumo.";
+                renderApp();
+            });
+        };
+
+        // Inicia a aplicação no carregamento da janela
+        window.onload = initializeFirebase;
+    </script>
+</body>
+</html>
